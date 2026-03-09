@@ -1,0 +1,515 @@
+
+import os
+import re
+import time
+import math
+import gc
+from typing import List, Set, Tuple, Dict, Optional
+
+
+# =============================================================================
+# HARD-CODE CONFIG (edit these)
+# =============================================================================
+ROOT_DIRECTORY = "/Users/Desktop/AGA-master/Input_Data/function2"
+RESULT_DIRECTORY = "/Users//Desktop/GETLO METHODS"
+
+COVERAGE_LEVEL = "method"   # "statement" or "method"
+DEPTH_D = 0                    # 0 == GeTLO-0 ; 6 == GeTLO-6 (paper uses these in experiments)
+PFD_CUT_RATIO = 0.25
+
+COVERAGE_FILES = {
+    "statement": ["state-map.txt", "state_map.txt"],
+    "method": [
+        "function.txt", "functions.txt",
+        "method.txt", "methods.txt",
+        "function-map.txt", "functions-map.txt",
+        "method-map.txt", "methods-map.txt",
+    ],
+}
+
+TESTLIST_HINT = "testList"
+MUTANT_HINT = "mutantKillMatrix"
+
+
+# =============================================================================
+# IO helpers
+# =============================================================================
+def read_lines(path: str) -> List[str]:
+    with open(path, "r") as f:
+        return [ln.strip() for ln in f.readlines()]
+
+def find_file_by_contains(folder: str, contains: str) -> Optional[str]:
+    for fn in os.listdir(folder):
+        if contains in fn:
+            return os.path.join(folder, fn)
+    return None
+
+def find_coverage_file(folder: str, level: str) -> Optional[str]:
+    # exact candidates
+    for cand in COVERAGE_FILES[level]:
+        p = os.path.join(folder, cand)
+        if os.path.exists(p):
+            return p
+    # fallback "contains"
+    for fn in os.listdir(folder):
+        low = fn.lower()
+        if level == "statement":
+            if "state-map" in low or "state_map" in low:
+                return os.path.join(folder, fn)
+        else:
+            if "function" in low or "method" in low:
+                return os.path.join(folder, fn)
+    return None
+
+def extract_s_number(name: str) -> int:
+    m = re.match(r"^\s*S(\d+)\b", name, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"(\d+)", name)
+    return int(m2.group(1)) if m2 else 999999
+
+
+# =============================================================================
+# Coverage parsing
+# =============================================================================
+def read_coverage_sets_and_sloc(coverage_path: str) -> Tuple[List[Set[int]], int]:
+    """
+    Reads adjacency-list coverage.
+    Returns:
+      cov_sets: list[set[int]] one per test
+      sloc: number of entities (max_id+1)
+    """
+    lines = read_lines(coverage_path)
+    cov_sets: List[Set[int]] = []
+    max_id = -1
+    for ln in lines:
+        if not ln:
+            cov_sets.append(set())
+            continue
+        ids = [int(x) for x in ln.split()]
+        if ids:
+            max_id = max(max_id, max(ids))
+        cov_sets.append(set(ids))
+    sloc = max_id + 1 if max_id >= 0 else 0
+    return cov_sets, sloc
+
+
+# =============================================================================
+# Metrics 
+# =============================================================================
+def _read_sequence(sequence_file: str) -> List[str]:
+    if not os.path.exists(sequence_file):
+        return []
+    with open(sequence_file, "r") as f:
+        return [ln.strip() for ln in f.readlines() if ln.strip()]
+
+def _compute_first_detection_positions(sequence_file: str, testlist: List[str], mutantkillmatrix: List[str]):
+    seq = _read_sequence(sequence_file)
+    if not seq or not mutantkillmatrix:
+        return seq, []
+    testname_index = {name: i for i, name in enumerate(testlist)}
+    n = len(seq)
+    m = len(mutantkillmatrix[0]) if mutantkillmatrix and mutantkillmatrix[0] else 0
+    if n == 0 or m == 0:
+        return seq, []
+    first = [None] * m
+    for rank, testname in enumerate(seq, start=1):
+        idx = testname_index.get(testname, None)
+        if idx is None:
+            continue
+        row = mutantkillmatrix[idx]
+        for j, ch in enumerate(row):
+            if ch == "1" and first[j] is None:
+                first[j] = rank
+    return seq, first
+
+def calculate_apfd(sequence_file: str, testlist: List[str], mutantkillmatrix: List[str]) -> Optional[float]:
+    seq, first = _compute_first_detection_positions(sequence_file, testlist, mutantkillmatrix)
+    if not seq or not first:
+        return None
+    n, m = len(seq), len(first)
+    if n == 0 or m == 0:
+        return None
+    sum_tf = sum(pos for pos in first if pos is not None)
+    return 1.0 - (sum_tf / (n * m)) + (1.0 / (2.0 * n))
+
+def calculate_napfd(sequence_file: str, testlist: List[str], mutantkillmatrix: List[str]) -> Optional[float]:
+    seq, first = _compute_first_detection_positions(sequence_file, testlist, mutantkillmatrix)
+    if not seq or not first:
+        return None
+    n, m = len(seq), len(first)
+    if n == 0 or m == 0:
+        return None
+    detected = [pos for pos in first if pos is not None]
+    md = len(detected)
+    p = md / m
+    sum_tf = float(sum(detected))
+    return p - (sum_tf / (n * m)) + (p / (2.0 * n))
+
+def calculate_pfd(sequence_file: str, testlist: List[str], mutantkillmatrix: List[str], cut_ratio=PFD_CUT_RATIO) -> Optional[float]:
+    seq, first = _compute_first_detection_positions(sequence_file, testlist, mutantkillmatrix)
+    if not seq or not first:
+        return None
+    n, m = len(seq), len(first)
+    if n == 0 or m == 0:
+        return None
+    k = int(math.ceil(cut_ratio * n))
+    k = max(1, min(k, n))
+    detected_by_k = sum(1 for pos in first if (pos is not None and pos <= k))
+    return detected_by_k / m
+
+
+# =============================================================================
+# GeTLO core utilities
+# =============================================================================
+def occ_permutation(cc: List[int]) -> Tuple[List[int], List[int]]:
+    """
+    Returns:
+      occ_vals: cc values sorted ascending (stable by entity id)
+      perm_entities: entity indices in the order that produces occ (Π such that Π(cc)=occ)
+    """
+    perm_entities = sorted(range(len(cc)), key=lambda e: (cc[e], e))  # stable tie by id
+    occ_vals = [cc[e] for e in perm_entities]
+    return occ_vals, perm_entities
+
+def compute_q_from_occ(occ_vals: List[int]) -> List[int]:
+    """Run-lengths of equal values in occ."""
+    if not occ_vals:
+        return []
+    q = []
+    cur = occ_vals[0]
+    cnt = 1
+    for v in occ_vals[1:]:
+        if v == cur:
+            cnt += 1
+        else:
+            q.append(cnt)
+            cur = v
+            cnt = 1
+    q.append(cnt)
+    return q
+
+def build_partition_id_by_pos(q: List[int]) -> List[int]:
+    """
+    For positions 0..n-1 in occ, map each position -> partition index (0..r-1).
+    """
+    part_by_pos = []
+    p = 0
+    for pi, sz in enumerate(q):
+        for _ in range(sz):
+            part_by_pos.append(pi)
+            p += 1
+    return part_by_pos
+
+def lex_compare(a: List[int], b: List[int]) -> int:
+    """
+    Lexicographic compare (descending preference):
+      return +1 if a > b (a higher rank)
+             -1 if a < b
+              0 if equal
+    """
+    L = min(len(a), len(b))
+    for i in range(L):
+        if a[i] != b[i]:
+            return 1 if a[i] > b[i] else -1
+    if len(a) == len(b):
+        return 0
+    # longer vector shouldn't happen here; but keep safe:
+    return 1 if len(a) > len(b) else -1
+
+def compute_weight_vector_for_test(
+    test_cov: Set[int],
+    pos_of_entity: List[int],
+    part_by_pos: List[int],
+    r: int
+) -> List[int]:
+    """
+    Computes w_i^s:
+      partition sums of oc_i (Π(ci)) without explicitly constructing oc_i.
+    """
+    w = [0] * r
+    for e in test_cov:
+        if 0 <= e < len(pos_of_entity):
+            pos = pos_of_entity[e]
+            pi = part_by_pos[pos]
+            w[pi] += 1
+    return w
+
+def occ_after_adding(cc: List[int], test_cov: Set[int]) -> List[int]:
+    """
+    For lookahead: compute occ of cc' = cc + c(test) (binary addition per covered entity).
+    """
+    cc2 = cc[:]  # copy
+    for e in test_cov:
+        if 0 <= e < len(cc2):
+            cc2[e] += 1
+    occ_vals, _ = occ_permutation(cc2)
+    return occ_vals
+
+
+# =============================================================================
+# Enhanced GeTLO with depth-D lookahead for G-ties
+# =============================================================================
+def pick_with_lookahead(
+    candidates: List[int],
+    cc: List[int],
+    cov_sets: List[Set[int]],
+    remaining: Set[int],
+    depth: int
+) -> int:
+    """
+    candidates: indices of tests that are tied at current step
+    depth: number of extra steps to simulate (d in the paper)
+    Rule: choose the candidate whose resulting occ_{s+depth} has highest lex rank.
+    Tie-breaker: smallest test index.
+    """
+    if depth <= 0 or len(candidates) <= 1:
+        return min(candidates)
+
+    best_c = None
+    best_occ = None
+
+    for c in sorted(candidates):
+        # simulate selecting c, then proceed greedily for 'depth' steps using GeTLO-0
+        cc_sim = cc[:]
+        rem_sim = set(remaining)
+
+        if c not in rem_sim:
+            continue
+        rem_sim.remove(c)
+        for e in cov_sets[c]:
+            if 0 <= e < len(cc_sim):
+                cc_sim[e] += 1
+
+        steps_left = depth
+        while steps_left > 0 and rem_sim:
+            # run one GeTLO selection step (without further recursion)
+            occ_vals, perm_entities = occ_permutation(cc_sim)
+            q = compute_q_from_occ(occ_vals)
+            r = len(q) if q else 0
+            if r == 0:
+                # no entities
+                break
+            part_by_pos = build_partition_id_by_pos(q)
+
+            pos_of_entity = [-1] * len(cc_sim)
+            for pos, ent in enumerate(perm_entities):
+                pos_of_entity[ent] = pos
+
+            best_w = None
+            tied = []
+            for t in rem_sim:
+                w = compute_weight_vector_for_test(cov_sets[t], pos_of_entity, part_by_pos, r)
+                if best_w is None:
+                    best_w = w
+                    tied = [t]
+                else:
+                    cmpv = lex_compare(w, best_w)
+                    if cmpv > 0:
+                        best_w = w
+                        tied = [t]
+                    elif cmpv == 0:
+                        tied.append(t)
+
+            chosen = min(tied)  # GeTLO tie-break rule
+            rem_sim.remove(chosen)
+            for e in cov_sets[chosen]:
+                if 0 <= e < len(cc_sim):
+                    cc_sim[e] += 1
+
+            steps_left -= 1
+
+        # evaluate occ at depth horizon
+        occ_h = occ_permutation(cc_sim)[0]
+
+        if best_occ is None:
+            best_occ = occ_h
+            best_c = c
+        else:
+            cmpo = lex_compare(occ_h, best_occ)
+            if cmpo > 0:
+                best_occ = occ_h
+                best_c = c
+            elif cmpo == 0:
+                best_c = min(best_c, c)
+
+    return best_c if best_c is not None else min(candidates)
+
+
+# =============================================================================
+# Main GeTLO
+# =============================================================================
+def getlo_prioritize(cov_sets: List[Set[int]], sloc: int, depth_d: int) -> List[int]:
+    """
+    Returns ordering of test indices (0..m-1) using GeTLO with optional lookahead depth.
+    """
+    m = len(cov_sets)
+    cc = [0] * sloc
+    remaining = set(range(m))
+    ordering: List[int] = []
+
+    while remaining:
+        occ_vals, perm_entities = occ_permutation(cc)
+        q = compute_q_from_occ(occ_vals)
+        r = len(q) if q else 0
+        if r == 0:
+            # no entities: just append remaining in index order
+            ordering.extend(sorted(remaining))
+            break
+
+        part_by_pos = build_partition_id_by_pos(q)
+
+        # map entity -> position in occ
+        pos_of_entity = [-1] * sloc
+        for pos, ent in enumerate(perm_entities):
+            pos_of_entity[ent] = pos
+
+        best_w = None
+        tied: List[int] = []
+
+        # Evaluate each remaining test: compute w_i^s and take highest lex rank
+        for t in remaining:
+            w = compute_weight_vector_for_test(cov_sets[t], pos_of_entity, part_by_pos, r)
+            if best_w is None:
+                best_w = w
+                tied = [t]
+            else:
+                cmpv = lex_compare(w, best_w)
+                if cmpv > 0:
+                    best_w = w
+                    tied = [t]
+                elif cmpv == 0:
+                    tied.append(t)
+
+        # break G-ties
+        if len(tied) == 1 or depth_d <= 0:
+            chosen = min(tied)  # paper's deterministic rule for GeTLO
+        else:
+            chosen = pick_with_lookahead(tied, cc, cov_sets, remaining, depth_d)
+
+        ordering.append(chosen)
+        remaining.remove(chosen)
+
+        # update cc ← cc + c_best
+        for e in cov_sets[chosen]:
+            if 0 <= e < sloc:
+                cc[e] += 1
+
+    return ordering
+
+
+# =============================================================================
+# HTML summary
+# =============================================================================
+def write_big_summary_html(rows: List[Dict], out_path: str):
+    def fmt(x):
+        return "N/A" if x is None else f"{x:.4f}"
+
+    rows_sorted = sorted(rows, key=lambda r: extract_s_number(r["project"]))
+
+    html = f"""
+    <html><head><title>GeTLO Summary</title>
+    <style>
+      body {{ font-family: Arial, sans-serif; }}
+      table {{ width: 100%; border-collapse: collapse; }}
+      th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+      th {{ background: #f2f2f2; }}
+    </style></head>
+    <body>
+      <h1>GeTLO (Lexicographical Ordering) Summary</h1>
+      <p><strong>Coverage level:</strong> {COVERAGE_LEVEL}</p>
+      <p><strong>Depth D:</strong> {DEPTH_D}</p>
+      <table>
+        <tr>
+          <th>Project</th>
+          <th>nTests</th>
+          <th>nEntities</th>
+          <th>ExecTime(s)</th>
+          <th>APFD</th>
+          <th>NAPFD</th>
+          <th>PFD@{int(PFD_CUT_RATIO*100)}%</th>
+        </tr>
+    """
+    for r in rows_sorted:
+        html += f"""
+        <tr>
+          <td>{r['project']}</td>
+          <td>{r.get('m','')}</td>
+          <td>{r.get('n','')}</td>
+          <td>{fmt(r.get('time'))}</td>
+          <td>{fmt(r.get('apfd'))}</td>
+          <td>{fmt(r.get('napfd'))}</td>
+          <td>{fmt(r.get('pfd'))}</td>
+        </tr>
+        """
+    html += "</table></body></html>"
+    with open(out_path, "w") as f:
+        f.write(html)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    os.makedirs(RESULT_DIRECTORY, exist_ok=True)
+    results = []
+
+    for folder in os.listdir(ROOT_DIRECTORY):
+        project_path = os.path.join(ROOT_DIRECTORY, folder)
+        if not os.path.isdir(project_path):
+            continue
+
+        test_list_file = find_file_by_contains(project_path, TESTLIST_HINT)
+        mutant_file = find_file_by_contains(project_path, MUTANT_HINT)
+        coverage_file = find_coverage_file(project_path, COVERAGE_LEVEL)
+
+        if not (test_list_file and mutant_file and coverage_file):
+            continue
+
+        testlist = read_lines(test_list_file)
+        mutantkillmatrix = read_lines(mutant_file)
+        cov_sets, sloc = read_coverage_sets_and_sloc(coverage_file)
+
+        if len(testlist) != len(cov_sets):
+            print(f"[WARN] {folder}: testList({len(testlist)}) != coverage rows({len(cov_sets)}). Skipping.")
+            continue
+
+        print(f"\n[GeTLO] Processing: {folder} (m={len(cov_sets)}, n={sloc}, D={DEPTH_D})")
+
+        out_dir = os.path.join(RESULT_DIRECTORY, folder)
+        os.makedirs(out_dir, exist_ok=True)
+
+        t0 = time.time()
+        order_idx = getlo_prioritize(cov_sets, sloc, DEPTH_D)
+        elapsed = time.time() - t0
+
+        seq_file = os.path.join(out_dir, "SequenceGAMethod_final.txt")
+        with open(seq_file, "w") as f:
+            for idx in order_idx:
+                f.write(testlist[idx] + "\n")
+
+        apfd = calculate_apfd(seq_file, testlist, mutantkillmatrix)
+        napfd = calculate_napfd(seq_file, testlist, mutantkillmatrix)
+        pfd = calculate_pfd(seq_file, testlist, mutantkillmatrix, cut_ratio=PFD_CUT_RATIO)
+
+        print(f"  time={elapsed:.2f}s APFD={apfd} NAPFD={napfd} PFD={pfd}")
+
+        results.append({
+            "project": folder,
+            "m": len(cov_sets),
+            "n": sloc,
+            "time": elapsed,
+            "apfd": apfd,
+            "napfd": napfd,
+            "pfd": pfd,
+        })
+
+        gc.collect()
+
+    out_html = os.path.join(RESULT_DIRECTORY, "GETLO_summary.html")
+    write_big_summary_html(results, out_html)
+    print("\nDone. Big summary saved to:\n ", out_html)
+
+
+if __name__ == "__main__":
+    main()
